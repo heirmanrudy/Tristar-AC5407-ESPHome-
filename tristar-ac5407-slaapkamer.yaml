@@ -1,0 +1,445 @@
+# HAOS - Tristar AC-5407 slaapkamer / ESPHome V10.8
+# 16-11-2026: TIMER +1u bedient de echte IR-timer (geen softwaretimer).
+# GitHub publicatiekopie - geen credentials opgenomen.
+# Gebaseerd op V10.7; bediening van klimaat en display ongewijzigd.
+# Timeruren 1..11 bevestigd door gebruiker; ESPHome-compilatie nog niet getest.
+# Publieke versie: API- en Wi-Fi-geheimen uitsluitend via lokale secrets.yaml.
+
+esphome:
+  name: tristar-ac5407-slaapkamer
+  friendly_name: tristar-ac5407-slaapkamer
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // M5StickS3: IR TX en RX vereisen EXT_5V_EN.
+          // Dit was in de V8-USB-test UIT (PWR_CFG 0x17).
+          // In outputmodus mag er GEEN externe 5V-voeding aan de Grove/EXT_5V-poort.
+          const auto pwr = id(tristar_pm1).read_byte(0x06);
+          if (!pwr.has_value()) {
+            ESP_LOGE("tristar_v9", "M5PM1 voeding: register 0x06 niet leesbaar");
+          } else {
+            const uint8_t boosted = uint8_t(*pwr | 0x08);
+            if (!id(tristar_pm1).write_byte(0x06, boosted)) {
+              ESP_LOGE("tristar_v9", "M5PM1: EXT_5V_EN inschakelen MISLUKT");
+            } else {
+              const auto verify = id(tristar_pm1).read_byte(0x06);
+              ESP_LOGI("tristar_v9", "M5PM1: PWR_CFG voor=0x%02X na=%s; 5V_BOOST=%s",
+                       (unsigned)*pwr,
+                       verify.has_value() ? "gelezen" : "LEESFOUT",
+                       (verify.has_value() && ((*verify) & 0x08)) ? "AAN" : "NIET BEVESTIGD");
+            }
+          }
+
+          // Bevestigde V8-methode: speaker-versterker PYG3 uitschakelen.
+          // Zo blijft de PMIC-configuratie reproduceerbaar voor IR-ontvangst.
+          const auto out = id(tristar_pm1).read_byte(0x11);
+          const auto drv = id(tristar_pm1).read_byte(0x13);
+          const auto func = id(tristar_pm1).read_byte(0x16);
+          const auto mode = id(tristar_pm1).read_byte(0x10);
+          if (out.has_value() && drv.has_value() &&
+              func.has_value() && mode.has_value()) {
+            const bool ok =
+              id(tristar_pm1).write_byte(0x11, uint8_t(*out & 0xF7)) &&
+              id(tristar_pm1).write_byte(0x13, uint8_t(*drv & 0xF7)) &&
+              id(tristar_pm1).write_byte(0x16, uint8_t(*func & 0x3F)) &&
+              id(tristar_pm1).write_byte(0x10, uint8_t(*mode | 0x08));
+            ESP_LOGI("tristar_v9", "SPK AMP uitschakelen: %s", ok ? "opdracht OK" : "FOUT");
+          } else {
+            ESP_LOGW("tristar_v9", "SPK AMP status niet volledig leesbaar");
+          }
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: tristar-ac5407- Fallback Hotspot
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# Interne I2C bus van de M5StickS3 (zoals V8).
+i2c:
+  sda: GPIO47
+  scl: GPIO48
+  scan: true
+
+i2c_device:
+  id: tristar_pm1
+  address: 0x6E
+
+# M5StickS3 ingebouwde IR-zendled; GPIO42 wordt niet meer gebruikt.
+# ESP32-S3 RMT maakt de 38kHz gemoduleerde IR-pulsen voor ESPHome zhlt01.
+remote_transmitter:
+  id: tristar_ir_tx
+  pin: GPIO46
+  carrier_duty_percent: 50%
+  rmt_symbols: 192
+
+# ESPHome kent het ZH/LT-01-protocol zelf: geen leer-/capturecodes vereist.
+# AC-5407 is volgens handleiding een airco zonder verwarming.
+climate:
+  - platform: zhlt01
+    name: "Tristar AC-5407 slaapkamer"
+    id: tristar_ac5407
+    supports_cool: true
+    supports_heat: false
+
+# De fysieke Tristar-timer is niet uitleesbaar via IR. Daarom bewaart de S3
+# alleen het laatst door hem ingestelde aantal uren (1..11), niet de resterende
+# tijd en niet de status van de originele afstandsbediening.
+# Bij herstart begint de teller op 0; als de originele ZH gebruikt wordt kan de
+# teller afwijken. Gebruik dan 'Tristar IR timer teller reset (alleen S3)'.
+globals:
+  - id: tristar_ir_timer_laatst_ingesteld
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+text_sensor:
+  - platform: template
+    name: "Tristar IR timer laatst ingesteld"
+    id: tristar_ir_timer_laatst_ingesteld_sensor
+    icon: mdi:timer-outline
+    update_interval: never
+    lambda: |-
+      const int uur = id(tristar_ir_timer_laatst_ingesteld);
+      if (uur == 0) return {"Geen instelling in S3"};
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%d uur (laatst verzonden)", uur);
+      return {buf};
+
+# Vaste LAMP-bediening; geen keuzelijst of diagnoseknoppen meer.
+# Let op: deze IR-code verzendt alleen wanneer HA-klimaatmodus AAN staat.
+button:
+  - platform: template
+    name: "Tristar Display UIT"
+    icon: mdi:lightbulb-off-outline
+    on_press:
+      - lambda: |-
+          // V10.5: vaste LAMP-knopcode 0x0B en bewezen displaystatusbit.
+          // De werkende klimaatregeling wordt NIET bediend/aangepast.
+          // Zender: GPIO46, dezelfde transmissie-interface als ESPHome zhlt01.
+          auto *ac = id(tristar_ac5407);
+          if (ac->mode == climate::CLIMATE_MODE_OFF) {
+            ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: klimaat staat UIT in HA. Zet de airco eerst via HA op KOELEN.");
+            return;
+          }
+          const float temp = ac->target_temperature;
+          if (!(temp >= 16.0f && temp <= 32.0f)) {
+            ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: ongeldige temperatuur %.1f", temp);
+            return;
+          }
+          const uint8_t lamp_bit = 0x01;
+
+          uint8_t msg[12] = {0};
+          // Standaard zhlt01: timerwaarde uit; geen bestaande timerstatus bekend.
+          msg[1] = 0x00;
+          // Andere statusbit voor TURBO behouden als zhlt01-regeling aangeeft BOOST.
+          if (ac->preset.value_or(climate::CLIMATE_PRESET_NONE) == climate::CLIMATE_PRESET_BOOST) {
+            msg[3] = 0x08;
+          }
+          msg[3] |= lamp_bit;
+          // Bevestigd uit IR-opnames: LAMP commandobyte[5] = 0x0B.
+          msg[5] = 0x0B;
+
+          // Byte 7: huidige AAN-modus, swing en ventilatorsnelheid behouden.
+          msg[7] = 0x02;
+          switch (ac->swing_mode) {
+            case climate::CLIMATE_SWING_OFF: msg[7] |= 0x10 | 0x08; break;
+            case climate::CLIMATE_SWING_HORIZONTAL: msg[7] |= 0x08; break;
+            case climate::CLIMATE_SWING_VERTICAL: msg[7] |= 0x10 | 0x04; break;
+            case climate::CLIMATE_SWING_BOTH: msg[7] |= 0x04; break;
+            default: break;
+          }
+          switch (ac->preset.value_or(climate::CLIMATE_PRESET_NONE)) {
+            case climate::CLIMATE_PRESET_BOOST:
+              msg[7] |= 0x20;
+              break;
+            case climate::CLIMATE_PRESET_SLEEP:
+              msg[7] |= 0x01;
+              break;
+            default:
+              switch (ac->fan_mode.value_or(climate::CLIMATE_FAN_ON)) {
+                case climate::CLIMATE_FAN_LOW: msg[7] |= 0x60; break;
+                case climate::CLIMATE_FAN_MEDIUM: msg[7] |= 0x40; break;
+                case climate::CLIMATE_FAN_HIGH: msg[7] |= 0x20; break;
+                case climate::CLIMATE_FAN_AUTO: msg[7] |= 0x00; break;
+                default: break;
+              }
+          }
+
+          // Byte 9: gebruik dezelfde mode-/temperatuurcodering als ESPHome.
+          switch (ac->mode) {
+            case climate::CLIMATE_MODE_AUTO:
+            case climate::CLIMATE_MODE_HEAT_COOL: msg[9] = 0x00; break;
+            case climate::CLIMATE_MODE_COOL: msg[9] = 0x20; break;
+            case climate::CLIMATE_MODE_HEAT: msg[9] = 0x80; break;
+            case climate::CLIMATE_MODE_DRY: msg[9] = 0x40; break;
+            case climate::CLIMATE_MODE_FAN_ONLY: msg[9] = 0x60; break;
+            default:
+              ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: klimaatmodus niet ondersteund");
+              return;
+          }
+          msg[9] |= static_cast<uint8_t>(temp - 16.0f);
+          msg[11] = 0xD5;  // Bekende remote-ID.
+          for (int i = 0; i < 12; i += 2) msg[i] = uint8_t(~msg[i + 1]);
+
+          ESP_LOGI("tristar_display", "DISPLAY_IR_START byte3=0x%02X byte5=0x%02X", msg[3], msg[5]);
+          ESP_LOGI("tristar_display", "FRAME=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   msg[0],msg[1],msg[2],msg[3],msg[4],msg[5],
+                   msg[6],msg[7],msg[8],msg[9],msg[10],msg[11]);
+
+          // Exact dezelfde 38-kHz pulsstructuur en LSB-first bitvolgorde
+          // als de werkende ESPHome ZHLT01Climate::transmit_state().
+          auto tx = id(tristar_ir_tx).transmit();
+          auto *data = tx.get_data();
+          data->set_carrier_frequency(38000);
+          data->mark(6100);
+          data->space(7400);
+          for (uint8_t b : msg) {
+            for (uint8_t bit = 0; bit < 8; ++bit) {
+              data->mark(500);
+              data->space((b & (1u << bit)) ? 1800 : 600);
+            }
+          }
+          data->mark(500);
+          data->space(0);
+          tx.perform();
+          ESP_LOGI("tristar_display", "DISPLAY_IR_VERZONDEN statusbit=0x%02X", lamp_bit);
+
+
+  - platform: template
+    name: "Tristar Display AAN"
+    icon: mdi:lightbulb-on-outline
+    on_press:
+      - lambda: |-
+          // V10.5: vaste LAMP-knopcode 0x0B en bewezen displaystatusbit.
+          // De werkende klimaatregeling wordt NIET bediend/aangepast.
+          // Zender: GPIO46, dezelfde transmissie-interface als ESPHome zhlt01.
+          auto *ac = id(tristar_ac5407);
+          if (ac->mode == climate::CLIMATE_MODE_OFF) {
+            ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: klimaat staat UIT in HA. Zet de airco eerst via HA op KOELEN.");
+            return;
+          }
+          const float temp = ac->target_temperature;
+          if (!(temp >= 16.0f && temp <= 32.0f)) {
+            ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: ongeldige temperatuur %.1f", temp);
+            return;
+          }
+          const uint8_t lamp_bit = 0x00;
+
+          uint8_t msg[12] = {0};
+          // Standaard zhlt01: timerwaarde uit; geen bestaande timerstatus bekend.
+          msg[1] = 0x00;
+          // Andere statusbit voor TURBO behouden als zhlt01-regeling aangeeft BOOST.
+          if (ac->preset.value_or(climate::CLIMATE_PRESET_NONE) == climate::CLIMATE_PRESET_BOOST) {
+            msg[3] = 0x08;
+          }
+          msg[3] |= lamp_bit;
+          // Bevestigd uit IR-opnames: LAMP commandobyte[5] = 0x0B.
+          msg[5] = 0x0B;
+
+          // Byte 7: huidige AAN-modus, swing en ventilatorsnelheid behouden.
+          msg[7] = 0x02;
+          switch (ac->swing_mode) {
+            case climate::CLIMATE_SWING_OFF: msg[7] |= 0x10 | 0x08; break;
+            case climate::CLIMATE_SWING_HORIZONTAL: msg[7] |= 0x08; break;
+            case climate::CLIMATE_SWING_VERTICAL: msg[7] |= 0x10 | 0x04; break;
+            case climate::CLIMATE_SWING_BOTH: msg[7] |= 0x04; break;
+            default: break;
+          }
+          switch (ac->preset.value_or(climate::CLIMATE_PRESET_NONE)) {
+            case climate::CLIMATE_PRESET_BOOST:
+              msg[7] |= 0x20;
+              break;
+            case climate::CLIMATE_PRESET_SLEEP:
+              msg[7] |= 0x01;
+              break;
+            default:
+              switch (ac->fan_mode.value_or(climate::CLIMATE_FAN_ON)) {
+                case climate::CLIMATE_FAN_LOW: msg[7] |= 0x60; break;
+                case climate::CLIMATE_FAN_MEDIUM: msg[7] |= 0x40; break;
+                case climate::CLIMATE_FAN_HIGH: msg[7] |= 0x20; break;
+                case climate::CLIMATE_FAN_AUTO: msg[7] |= 0x00; break;
+                default: break;
+              }
+          }
+
+          // Byte 9: gebruik dezelfde mode-/temperatuurcodering als ESPHome.
+          switch (ac->mode) {
+            case climate::CLIMATE_MODE_AUTO:
+            case climate::CLIMATE_MODE_HEAT_COOL: msg[9] = 0x00; break;
+            case climate::CLIMATE_MODE_COOL: msg[9] = 0x20; break;
+            case climate::CLIMATE_MODE_HEAT: msg[9] = 0x80; break;
+            case climate::CLIMATE_MODE_DRY: msg[9] = 0x40; break;
+            case climate::CLIMATE_MODE_FAN_ONLY: msg[9] = 0x60; break;
+            default:
+              ESP_LOGW("tristar_display", "DISPLAYOPDRACHT GEWEIGERD: klimaatmodus niet ondersteund");
+              return;
+          }
+          msg[9] |= static_cast<uint8_t>(temp - 16.0f);
+          msg[11] = 0xD5;  // Bekende remote-ID.
+          for (int i = 0; i < 12; i += 2) msg[i] = uint8_t(~msg[i + 1]);
+
+          ESP_LOGI("tristar_display", "DISPLAY_IR_START byte3=0x%02X byte5=0x%02X", msg[3], msg[5]);
+          ESP_LOGI("tristar_display", "FRAME=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   msg[0],msg[1],msg[2],msg[3],msg[4],msg[5],
+                   msg[6],msg[7],msg[8],msg[9],msg[10],msg[11]);
+
+          // Exact dezelfde 38-kHz pulsstructuur en LSB-first bitvolgorde
+          // als de werkende ESPHome ZHLT01Climate::transmit_state().
+          auto tx = id(tristar_ir_tx).transmit();
+          auto *data = tx.get_data();
+          data->set_carrier_frequency(38000);
+          data->mark(6100);
+          data->space(7400);
+          for (uint8_t b : msg) {
+            for (uint8_t bit = 0; bit < 8; ++bit) {
+              data->mark(500);
+              data->space((b & (1u << bit)) ? 1800 : 600);
+            }
+          }
+          data->mark(500);
+          data->space(0);
+          tx.perform();
+          ESP_LOGI("tristar_display", "DISPLAY_IR_VERZONDEN statusbit=0x%02X", lamp_bit);
+
+
+
+
+  - platform: template
+    name: "Tristar IR timer teller reset (alleen S3)"
+    icon: mdi:counter
+    on_press:
+      - lambda: |-
+          // Dit is GEEN IR-commando: de timer op de airco wordt niet geannuleerd.
+          id(tristar_ir_timer_laatst_ingesteld) = 0;
+          id(tristar_ir_timer_laatst_ingesteld_sensor).publish_state("Geen instelling in S3");
+          ESP_LOGI("tristar_timer_ir", "Alleen lokale timer-teller gereset; fysieke airco-timer ONGEWIJZIGD");
+
+  - platform: template
+    name: "Tristar IR Timer +1 uur"
+    icon: mdi:timer-plus-outline
+    on_press:
+      - lambda: |-
+          // V10.8: iedere druk verzendt de volgende absolute ingebouwde timerduur.
+          // De werkende klimaatregeling wordt NIET bediend/aangepast.
+          // Zender: GPIO46, dezelfde transmissie-interface als ESPHome zhlt01.
+          auto *ac = id(tristar_ac5407);
+          if (ac->mode == climate::CLIMATE_MODE_OFF) {
+            ESP_LOGW("tristar_timer_ir", "IR timer niet verzonden: klimaat staat UIT in HA.");
+            return;
+          }
+          const float temp = ac->target_temperature;
+          if (!(temp >= 16.0f && temp <= 32.0f)) {
+            ESP_LOGW("tristar_timer_ir", "IR timer niet verzonden: ongeldige temperatuur %.1f", temp);
+            return;
+          }
+          // Alle waarden 1..11 zijn via de V10.7-schuifregelaar fysiek bevestigd.
+          // Max 11, want alleen dat bereik is eerder getest.
+          const int vorige = id(tristar_ir_timer_laatst_ingesteld);
+          if (vorige >= 11) {
+            ESP_LOGW("tristar_timer_ir", "Maximum 11 uur. Gebruik eventueel de originele afstandsbediening.");
+            return;
+          }
+          const int uur = vorige + 1;
+          const uint8_t timer_byte = uint8_t(0xA0 | uur);
+
+          uint8_t msg[12] = {0};
+          // Bevestigde uurwaarde voor de fysieke IR-timer.
+          msg[1] = timer_byte;
+          // Andere statusbit voor TURBO behouden als zhlt01-regeling aangeeft BOOST.
+          if (ac->preset.value_or(climate::CLIMATE_PRESET_NONE) == climate::CLIMATE_PRESET_BOOST) {
+            msg[3] = 0x08;
+          }
+          // De displaystatus is niet terugleesbaar; stuur GEEN LAMP-wijziging.
+          // Bevestigd uit IR-opnames: TIMER commandobyte[5] = 0x06.
+          msg[5] = 0x06;
+
+          // Byte 7: huidige AAN-modus, swing en ventilatorsnelheid behouden.
+          msg[7] = 0x02;
+          switch (ac->swing_mode) {
+            case climate::CLIMATE_SWING_OFF: msg[7] |= 0x10 | 0x08; break;
+            case climate::CLIMATE_SWING_HORIZONTAL: msg[7] |= 0x08; break;
+            case climate::CLIMATE_SWING_VERTICAL: msg[7] |= 0x10 | 0x04; break;
+            case climate::CLIMATE_SWING_BOTH: msg[7] |= 0x04; break;
+            default: break;
+          }
+          switch (ac->preset.value_or(climate::CLIMATE_PRESET_NONE)) {
+            case climate::CLIMATE_PRESET_BOOST:
+              msg[7] |= 0x20;
+              break;
+            case climate::CLIMATE_PRESET_SLEEP:
+              msg[7] |= 0x01;
+              break;
+            default:
+              switch (ac->fan_mode.value_or(climate::CLIMATE_FAN_ON)) {
+                case climate::CLIMATE_FAN_LOW: msg[7] |= 0x60; break;
+                case climate::CLIMATE_FAN_MEDIUM: msg[7] |= 0x40; break;
+                case climate::CLIMATE_FAN_HIGH: msg[7] |= 0x20; break;
+                case climate::CLIMATE_FAN_AUTO: msg[7] |= 0x00; break;
+                default: break;
+              }
+          }
+
+          // Byte 9: gebruik dezelfde mode-/temperatuurcodering als ESPHome.
+          switch (ac->mode) {
+            case climate::CLIMATE_MODE_AUTO:
+            case climate::CLIMATE_MODE_HEAT_COOL: msg[9] = 0x00; break;
+            case climate::CLIMATE_MODE_COOL: msg[9] = 0x20; break;
+            case climate::CLIMATE_MODE_HEAT: msg[9] = 0x80; break;
+            case climate::CLIMATE_MODE_DRY: msg[9] = 0x40; break;
+            case climate::CLIMATE_MODE_FAN_ONLY: msg[9] = 0x60; break;
+            default:
+              ESP_LOGW("tristar_timer_ir", "TIMERTEST GEWEIGERD: klimaatmodus niet ondersteund");
+              return;
+          }
+          msg[9] |= static_cast<uint8_t>(temp - 16.0f);
+          msg[11] = 0xD5;  // Bekende remote-ID.
+          for (int i = 0; i < 12; i += 2) msg[i] = uint8_t(~msg[i + 1]);
+
+          ESP_LOGI("tristar_timer_ir", "TIMER_IR_START uur=%d byte1=0x%02X byte5=0x%02X", uur, msg[1], msg[5]);
+          ESP_LOGI("tristar_timer_ir", "FRAME=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                   msg[0],msg[1],msg[2],msg[3],msg[4],msg[5],
+                   msg[6],msg[7],msg[8],msg[9],msg[10],msg[11]);
+
+          // Exact dezelfde 38-kHz pulsstructuur en LSB-first bitvolgorde
+          // als de werkende ESPHome ZHLT01Climate::transmit_state().
+          auto tx = id(tristar_ir_tx).transmit();
+          auto *data = tx.get_data();
+          data->set_carrier_frequency(38000);
+          data->mark(6100);
+          data->space(7400);
+          for (uint8_t b : msg) {
+            for (uint8_t bit = 0; bit < 8; ++bit) {
+              data->mark(500);
+              data->space((b & (1u << bit)) ? 1800 : 600);
+            }
+          }
+          data->mark(500);
+          data->space(0);
+          tx.perform();
+          // Pas NA het versturen teller verhogen. Zonder RF/IR-terugmelding
+          // blijft fysieke ontvangst onbevestigd (richt de S3 naar de airco).
+          id(tristar_ir_timer_laatst_ingesteld) = uur;
+          char buf[32];
+          snprintf(buf, sizeof(buf), "%d uur (laatst verzonden)", uur);
+          id(tristar_ir_timer_laatst_ingesteld_sensor).publish_state(buf);
+          ESP_LOGI("tristar_timer_ir", "TIMER_IR_VERZONDEN uur=%d byte1=0x%02X", uur, timer_byte);
+
+
