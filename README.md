@@ -52,7 +52,11 @@ See [CHANGELOG.md](CHANGELOG.md) for the changes made for this public release.
 
 ## Licensing
 
-No explicit open-source license is included in this initial publication bundle. If you intend to grant reuse rights, choose an appropriate license after reviewing compatibility with any third-party code.
+This project is released under the MIT License.
+
+Copyright (c) 2026 Rudy Heirman.
+
+See the LICENSE file for the full license terms.
 
 ## Home Assistant Dashboard
 
