@@ -60,3 +60,4 @@ The screenshot below shows the Tristar AC-5407 controller integrated into Home A
 
 The dashboard provides temperature control, operating modes, fan speed, swing settings, display ON/OFF and native air-conditioner timer control.
 
+![Tristar AC-5407 Home Assistant Dashboard](tristar-dashboard.png)
