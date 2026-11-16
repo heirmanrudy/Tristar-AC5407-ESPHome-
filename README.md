@@ -53,3 +53,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the changes made for this public release.
 ## Licensing
 
 No explicit open-source license is included in this initial publication bundle. If you intend to grant reuse rights, choose an appropriate license after reviewing compatibility with any third-party code.
+
+Home Assistant Dashboard
+
+The screenshot below shows the Tristar AC-5407 controller integrated into Home Assistant.
+
+The dashboard provides temperature control, operating modes, fan speed, swing settings, display ON/OFF and native air-conditioner timer control.
+
